@@ -1,6 +1,5 @@
 import { Construct } from 'constructs';
-// import * as sqs from 'aws-cdk-lib/aws-sqs';
-import { Stack, RemovalPolicy, ResourceEnvironment, Size, CfnOutput } from "aws-cdk-lib";
+import { Stack, RemovalPolicy, ResourceEnvironment, Size, CfnOutput, Token, Tags, Annotations } from "aws-cdk-lib";
 import { aws_iam as iam } from "aws-cdk-lib";
 import { aws_ec2 as ec2 } from "aws-cdk-lib";
 import { aws_eks as eks } from "aws-cdk-lib";
@@ -42,11 +41,18 @@ export class Cluster extends Construct implements eks.ICluster {
   prune: boolean;
 
   private _awsAuth: AwsAuth;
+
+  private _cluster: eks.CfnCluster;
   
   constructor(scope: Construct, id: string, props: ClusterProps) {
     super(scope, id);
 
     this.stack = Stack.of(this);
+    this.prune = props.prune ?? true;
+    this.vpc = props.vpc || new ec2.Vpc(this, 'DefaultVpc');
+    this.kubectlLambdaRole = props.kubectlLambdaRole ? props.kubectlLambdaRole : undefined;
+
+    this.tagSubnets();
 
     const clusterRole = new iam.Role(this, 'ClusterRole', {
       assumedBy: new iam.ServicePrincipal('eks.amazonaws.com'),
@@ -56,17 +62,20 @@ export class Cluster extends Construct implements eks.ICluster {
       ],
     });
 
-    if (!props.vpc) throw Error();
-    this.vpc = props.vpc;
+    const securityGroup = props.securityGroup || new ec2.SecurityGroup(this, 'ControlPlaneSecurityGroup', {
+      vpc: this.vpc,
+      description: 'EKS Control Plane Security Group',
+    });
 
     if (!props.clusterName) throw Error();
     this.clusterName = props.clusterName;
 
     const endpointAccess = props.endpointAccess ?? eks.EndpointAccess.PUBLIC_AND_PRIVATE;
 
-    const cfnCluster = new eks.CfnCluster(this, "Resource", {
+    this._cluster = new eks.CfnCluster(this, "Resource", {
       resourcesVpcConfig: {
-        subnetIds: props.vpc.privateSubnets.map(s => s.subnetId),
+        securityGroupIds: [securityGroup.securityGroupId],
+        subnetIds: this.vpc.privateSubnets.map(s => s.subnetId),
         endpointPrivateAccess: endpointAccess._config.privateAccess,
         endpointPublicAccess: endpointAccess._config.publicAccess,
       },
@@ -78,32 +87,47 @@ export class Cluster extends Construct implements eks.ICluster {
       },
 
       name: props.clusterName,
-      tags: [{
-        key: 'Name',
-        value: props.clusterName,
-      }],
+      tags: [
+        {
+          key: 'Name',
+          value: props.clusterName,
+        },
+      ],
+      ...(props.secretsEncryptionKey ? {
+        encryptionConfig: [{
+          provider: {
+            keyArn: props.secretsEncryptionKey.keyArn,
+          },
+          resources: ['secrets'],
+        }],
+      } : {}),
       version: (props.version ? props.version : eks.KubernetesVersion.V1_21).version,
     });
-    this.clusterArn = cfnCluster.attrArn;
-    this.clusterEndpoint = cfnCluster.attrEndpoint;
+
+    this._cluster.node.addDependency(this.vpc);
+    
+    this.clusterArn = this._cluster.attrArn;
+    this.clusterEndpoint = this._cluster.attrEndpoint;
 
     this.openIdConnectProvider = new eks.OpenIdConnectProvider(this, 'OidcProvider', {
-      url: cfnCluster.attrOpenIdConnectIssuerUrl,
+      url: this._cluster.attrOpenIdConnectIssuerUrl,
     });
 
-    this.clusterCertificateAuthorityData = cfnCluster.attrCertificateAuthorityData;
-    this.clusterSecurityGroupId = cfnCluster.attrClusterSecurityGroupId;
-    this.clusterEncryptionConfigKeyArn = cfnCluster.attrEncryptionConfigKeyArn;
+    this.clusterCertificateAuthorityData = this._cluster.attrCertificateAuthorityData;
+    this.clusterSecurityGroupId = this._cluster.attrClusterSecurityGroupId;
+    this.clusterEncryptionConfigKeyArn = this._cluster.attrEncryptionConfigKeyArn;
     this.kubectlEnvironment = props.kubectlEnvironment;
     this.kubectlLayer = props.kubectlLayer;
     this.kubectlMemory = props.kubectlMemory;
     this.kubectlRole = props.adminRole;
-    // this.clusterSecurityGroup = ec2.SecurityGroup.fromLookupById(this, 'ClusterSecurityGroup', cfnCluster.attrClusterSecurityGroupId);
 
-    // this.connections = new ec2.Connections({
-    //   securityGroups: [this.clusterSecurityGroup],
-    //   defaultPort: ec2.Port.tcp(443), // Control Plane has an HTTPS API
-    // });
+    this.clusterSecurityGroupId = this._cluster.attrClusterSecurityGroupId;
+    this.clusterSecurityGroup = ec2.SecurityGroup.fromSecurityGroupId(this, 'ClusterSecurityGroup', this.clusterSecurityGroupId);
+
+    this.connections = new ec2.Connections({
+      securityGroups: [this.clusterSecurityGroup, securityGroup],
+      defaultPort: ec2.Port.tcp(443), // Control Plane has an HTTPS API
+    });
 
     const updateConfigCommandPrefix = `aws eks update-kubeconfig --name ${this.clusterName}`;
     const getTokenCommandPrefix = `aws eks get-token --cluster-name ${this.clusterName}`;
@@ -167,6 +191,32 @@ export class Cluster extends Construct implements eks.ICluster {
         'system:nodes',
       ],
     });
+    nodegroup.node.addDependency(this._cluster);
     return nodegroup;
+  }
+
+  public static fromClusterAttributes(scope: Construct, id: string, attrs: eks.ClusterAttributes): eks.ICluster {
+    return eks.Cluster.fromClusterAttributes(scope, id, attrs);
+  }
+
+  private tagSubnets() {
+    const tagAllSubnets = (type: string, subnets: ec2.ISubnet[], tag: string) => {
+      for (const subnet of subnets) {
+        // if this is not a concrete subnet, attach a construct warning
+        if (!ec2.Subnet.isVpcSubnet(subnet)) {
+          // message (if token): "could not auto-tag public/private subnet with tag..."
+          // message (if not token): "count not auto-tag public/private subnet xxxxx with tag..."
+          const subnetID = Token.isUnresolved(subnet.subnetId) || Token.isUnresolved([subnet.subnetId]) ? '' : ` ${subnet.subnetId}`;
+          Annotations.of(this).addWarning(`Could not auto-tag ${type} subnet${subnetID} with "${tag}=1", please remember to do this manually`);
+          continue;
+        }
+
+        Tags.of(subnet).add(tag, '1');
+      }
+    }
+
+    // https://docs.aws.amazon.com/eks/latest/userguide/network_reqs.html
+    tagAllSubnets('private', this.vpc.privateSubnets, 'kubernetes.io/role/internal-elb');
+    tagAllSubnets('public', this.vpc.publicSubnets, 'kubernetes.io/role/elb');
   }
 }
