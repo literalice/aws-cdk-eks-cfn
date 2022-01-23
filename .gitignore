@@ -6,3 +6,11 @@ node_modules
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+
+# Output
+dist/
+
+# Tools
+.env
+.envrc
+.tool-versions
