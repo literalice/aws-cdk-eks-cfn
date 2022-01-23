@@ -1,12 +1,43 @@
-# Welcome to your CDK TypeScript Construct Library project!
+# Amazon EKS Construct using CloudFormation Library
 
-You should explore the contents of this project. It demonstrates a CDK Construct Library that includes a construct (`AwsCdkEksCfn`)
-which contains an Amazon SQS queue that is subscribed to an Amazon SNS topic.
+## Usage
 
-The construct defines an interface (`AwsCdkEksCfnProps`) to configure the visibility timeout of the queue.
+```typescript
+const adminRole = new iam.Role(this, 'AdminRole', {
+  assumedBy: new iam.AccountRootPrincipal(),
+});
+if (adminRole.assumeRolePolicy) {
+  new iam.ServicePrincipal('cloudformation.amazonaws.com').addToAssumeRolePolicy(adminRole.assumeRolePolicy)
+}
+adminRole.addManagedPolicy(
+  iam.ManagedPolicy.fromAwsManagedPolicyName('AdministratorAccess'));
 
-## Useful commands
+new ClusterStack(app, 'ClusterStack', adminRole, {
+  synthesizer: new cdk.DefaultStackSynthesizer({
+    cloudFormationExecutionRole: process.env.CLUSTER_ADMIN_ROLE_ARN,
+  }),
+});
+```
 
- * `npm run build`   compile typescript to js
- * `npm run watch`   watch for changes and compile
- * `npm run test`    perform the jest unit tests
+```typescript
+import { aws_eks as eks } from "aws-cdk-lib";
+import { Cluster } from "@literalice/aws-cdk-eks-cfn";
+
+export class ClusterStack extends Stack {
+  constructor(scope: Construct, id: string, adminRole: iam.IRole, props?: StackProps) {
+    super(scope, id, props);
+
+    // ...
+
+    const cluster = new Cluster(this, 'Cluster', {
+      vpc,
+      clusterName,
+      endpointAccess: eks.EndpointAccess.PUBLIC_AND_PRIVATE,
+      adminRole,
+      mastersRole,
+      ipFamily: 'ipv6',
+      version: eks.KubernetesVersion.V1_21,
+    });
+  }
+}
+```
